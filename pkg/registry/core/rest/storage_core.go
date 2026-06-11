@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -510,9 +511,20 @@ func (p *legacyProvider) PostStartHook() (string, genericapiserver.PostStartHook
 		// apiserver if we can't repair them.
 		wg := sync.WaitGroup{}
 		wg.Add(2)
+		var clusterIPDone, nodePortDone atomic.Bool
+		clusterIPSuccess := func() {
+			clusterIPDone.Store(true)
+			klog.InfoS("initial service ClusterIP repair completed")
+			wg.Done()
+		}
+		nodePortSuccess := func() {
+			nodePortDone.Store(true)
+			klog.InfoS("initial service NodePort repair completed")
+			wg.Done()
+		}
 		runner := async.NewRunner(
-			func(stopCh chan struct{}) { p.startServiceClusterIPRepair(wg.Done, stopCh) },
-			func(stopCh chan struct{}) { p.startServiceNodePortsRepair(wg.Done, stopCh) },
+			func(stopCh chan struct{}) { p.startServiceClusterIPRepair(clusterIPSuccess, stopCh) },
+			func(stopCh chan struct{}) { p.startServiceNodePortsRepair(nodePortSuccess, stopCh) },
 		)
 		runner.Start()
 		go func() {
@@ -531,6 +543,9 @@ func (p *legacyProvider) PostStartHook() (string, genericapiserver.PostStartHook
 		select {
 		case <-done:
 		case <-time.After(time.Minute):
+			klog.ErrorS(nil, "initial IP and Port allocation check timed out",
+				"clusterIPRepairCompleted", clusterIPDone.Load(),
+				"nodePortRepairCompleted", nodePortDone.Load())
 			return goerrors.New("unable to perform initial IP and Port allocation check")
 		}
 

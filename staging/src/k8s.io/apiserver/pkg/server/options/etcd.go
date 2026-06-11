@@ -73,6 +73,7 @@ type EtcdOptions struct {
 
 var storageTypes = sets.NewString(
 	storagebackend.StorageTypeETCD3,
+	storagebackend.StorageTypeTiKV,
 )
 
 func NewEtcdOptions(backendConfig *storagebackend.Config) *EtcdOptions {
@@ -166,7 +167,9 @@ func (s *EtcdOptions) AddFlags(fs *pflag.FlagSet) {
 		"to not disable watch caching for that resource")
 
 	fs.StringVar(&s.StorageConfig.Type, "storage-backend", s.StorageConfig.Type,
-		"The storage backend for persistence. Options: 'etcd3' (default).")
+		"The storage backend for persistence. Options: 'etcd3' (default), 'tikv'. "+
+			"When 'tikv' is selected, --etcd-servers must list PD endpoints (host:port) "+
+			"and --etcd-cafile/--etcd-certfile/--etcd-keyfile configure mTLS to TiKV/PD.")
 
 	fs.StringSliceVar(&s.StorageConfig.Transport.ServerList, "etcd-servers", s.StorageConfig.Transport.ServerList,
 		"List of etcd servers to connect with (scheme://ip:port), comma separated.")

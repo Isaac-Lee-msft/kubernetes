@@ -36,6 +36,8 @@ func Create(c storagebackend.ConfigForResource, newFunc, newListFunc func() runt
 		return nil, nil, fmt.Errorf("%s is no longer a supported storage backend", c.Type)
 	case storagebackend.StorageTypeUnset, storagebackend.StorageTypeETCD3:
 		return newETCD3Storage(c, newFunc, newListFunc, resourcePrefix)
+	case storagebackend.StorageTypeTiKV:
+		return newTiKVStorage(c, newFunc, newListFunc, resourcePrefix)
 	default:
 		return nil, nil, fmt.Errorf("unknown storage type: %s", c.Type)
 	}
@@ -48,6 +50,8 @@ func CreateHealthCheck(c storagebackend.Config, stopCh <-chan struct{}) (func() 
 		return nil, fmt.Errorf("%s is no longer a supported storage backend", c.Type)
 	case storagebackend.StorageTypeUnset, storagebackend.StorageTypeETCD3:
 		return newETCD3HealthCheck(c, stopCh)
+	case storagebackend.StorageTypeTiKV:
+		return newTiKVHealthCheck(c, stopCh)
 	default:
 		return nil, fmt.Errorf("unknown storage type: %s", c.Type)
 	}
@@ -59,6 +63,8 @@ func CreateReadyCheck(c storagebackend.Config, stopCh <-chan struct{}) (func() e
 		return nil, fmt.Errorf("%s is no longer a supported storage backend", c.Type)
 	case storagebackend.StorageTypeUnset, storagebackend.StorageTypeETCD3:
 		return newETCD3ReadyCheck(c, stopCh)
+	case storagebackend.StorageTypeTiKV:
+		return newTiKVReadyCheck(c, stopCh)
 	default:
 		return nil, fmt.Errorf("unknown storage type: %s", c.Type)
 	}
@@ -70,6 +76,8 @@ func CreateProber(c storagebackend.Config) (Prober, error) {
 		return nil, fmt.Errorf("%s is no longer a supported storage backend", c.Type)
 	case storagebackend.StorageTypeUnset, storagebackend.StorageTypeETCD3:
 		return newETCD3ProberMonitor(c)
+	case storagebackend.StorageTypeTiKV:
+		return newTiKVProber(c)
 	default:
 		return nil, fmt.Errorf("unknown storage type: %s", c.Type)
 	}
@@ -81,6 +89,8 @@ func CreateMonitor(c storagebackend.Config) (metrics.Monitor, error) {
 		return nil, fmt.Errorf("%s is no longer a supported storage backend", c.Type)
 	case storagebackend.StorageTypeUnset, storagebackend.StorageTypeETCD3:
 		return newETCD3ProberMonitor(c)
+	case storagebackend.StorageTypeTiKV:
+		return newTiKVProber(c)
 	default:
 		return nil, fmt.Errorf("unknown storage type: %s", c.Type)
 	}
