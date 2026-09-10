@@ -108,6 +108,7 @@ func (w *watcher) Watch(ctx context.Context, key string, rev int64, opts storage
 		errCh:          make(chan error, 1),
 	}
 	wc.ctx, wc.cancel = context.WithCancel(ctx)
+	wc.newIter = wc.boundedSnapshotIter
 
 	sendInitial := opts.SendInitialEvents != nil && *opts.SendInitialEvents
 	metrics.IncWatchOpen()
@@ -140,6 +141,11 @@ type watchChan struct {
 	// readable.
 	prevFP map[string]fingerprint
 	prevTS uint64
+
+	// newIter opens the bounded MVCC scan for a seed or poll.  Watch() sets it
+	// to boundedSnapshotIter; tests substitute a fake so the event-emitting
+	// paths can be exercised without a live TiKV cluster.
+	newIter func(ts uint64) (scanIterator, error)
 }
 
 // ResultChan implements watch.Interface.
@@ -274,7 +280,7 @@ func hashValue(raw []byte) fingerprint {
 // seed), decoding and releasing each value immediately so the seed never holds
 // the whole resource in memory at once.
 func (wc *watchChan) scanAndEmit(ts uint64, emitInitial bool) (map[string]fingerprint, error) {
-	iter, err := wc.boundedSnapshotIter(ts)
+	iter, err := wc.newIter(ts)
 	if err != nil {
 		return nil, fmt.Errorf("tikv watcher: snapshot iter at ts=%d: %w", ts, err)
 	}
@@ -286,7 +292,7 @@ func (wc *watchChan) scanAndEmit(ts uint64, emitInitial bool) (map[string]finger
 		rawVal := iter.Value() // batch-owned; consumed before iter.Next()
 		fps[string(k)] = hashValue(rawVal)
 		if emitInitial {
-			if obj, derr := wc.decode(rawVal, ts); derr != nil {
+			if obj, derr := wc.decode(k, rawVal, ts); derr != nil {
 				klog.V(4).Infof("tikv watcher: decode error during initial events for %s: %v", k, derr)
 			} else if matched, merr := wc.pred.Matches(obj); merr == nil && matched {
 				wc.sendEvent(watch.Event{Type: watch.Added, Object: obj})
@@ -307,7 +313,7 @@ func (wc *watchChan) scanAndEmit(ts uint64, emitInitial bool) (map[string]finger
 // reconstructed by a historical single-key read at prevTS.  Only the fingerprint
 // map is retained, so steady-state memory is O(keys), not O(bytes).
 func (wc *watchChan) pollDiff(newTS uint64) (map[string]fingerprint, error) {
-	iter, err := wc.boundedSnapshotIter(newTS)
+	iter, err := wc.newIter(newTS)
 	if err != nil {
 		return nil, fmt.Errorf("tikv watcher: iter: %w", err)
 	}
@@ -323,7 +329,7 @@ func (wc *watchChan) pollDiff(newTS uint64) (map[string]fingerprint, error) {
 
 		switch oldHash, existed := wc.prevFP[ks]; {
 		case !existed:
-			if obj, derr := wc.decode(rawVal, newTS); derr != nil {
+			if obj, derr := wc.decode(k, rawVal, newTS); derr != nil {
 				klog.V(4).Infof("tikv watcher: decode error for added key %s: %v", k, derr)
 			} else if matched, _ := wc.pred.Matches(obj); matched {
 				wc.sendEvent(watch.Event{Type: watch.Added, Object: obj})
@@ -352,7 +358,7 @@ func (wc *watchChan) pollDiff(newTS uint64) (map[string]fingerprint, error) {
 // reconstructed (historical read at prevTS) so predicate-filter transitions
 // (enter -> Added, leave -> Deleted) are surfaced exactly as etcd would.
 func (wc *watchChan) emitModified(key, rawVal []byte, newTS uint64) {
-	newObj, err := wc.decode(rawVal, newTS)
+	newObj, err := wc.decode(key, rawVal, newTS)
 	if err != nil {
 		klog.V(4).Infof("tikv watcher: decode error for modified key %s: %v", key, err)
 		return
@@ -418,7 +424,7 @@ func (wc *watchChan) reconstructAt(key []byte, ts uint64) (runtime.Object, error
 	if len(val) == 0 {
 		return nil, nil
 	}
-	return wc.decode(val, ts)
+	return wc.decode(key, val, ts)
 }
 
 // sendInitialEventsEnd emits the mandatory WatchList InitialEventsEnd bookmark,
@@ -450,9 +456,17 @@ func (wc *watchChan) sendInitialEventsEnd(ts uint64) {
 // The rev embedded in the value's header is used as the object's
 // resourceVersion when present; for legacy unwrapped values it falls back to
 // the snapshot's timestamp so the watch stream still surfaces a non-zero RV.
-func (wc *watchChan) decode(rawValue []byte, revision uint64) (runtime.Object, error) {
+//
+// key MUST be the full stored key of THIS object, not the watch's prefix.  The
+// value transformer binds the key into the AES-GCM additional authenticated
+// data (see store.prepareKey / TransformToStorage, which encrypt under the
+// object's own prepared key).  Passing a recursive watch's prefix here makes
+// every decrypt fail with "cipher: message authentication failed", which
+// silently empties the watch cache for encrypted resources -- see
+// TestWatchDecodeUsesPerObjectKeyAsAAD.
+func (wc *watchChan) decode(key, rawValue []byte, revision uint64) (runtime.Object, error) {
 	data, _, err := wc.watcher.transformer.TransformFromStorage(
-		wc.ctx, rawValue, authenticatedDataString(wc.key))
+		wc.ctx, rawValue, authenticatedDataString(key))
 	if err != nil {
 		return nil, err
 	}

@@ -163,6 +163,11 @@ type store struct {
 	healthChecker  *healthChecker
 	newListFunc    func() runtime.Object
 	resourcePrefix string
+
+	// size is the approximate stored-byte total for this store's single
+	// resource collection, backing the per-collection write quota.  See
+	// quota.go for the accuracy model.
+	size collectionSize
 }
 
 var _ storage.Interface = (*store)(nil)
@@ -303,6 +308,7 @@ func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object,
 
 	startTime := time.Now()
 	var commitTS uint64
+	var createdBytes int64
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -342,6 +348,15 @@ func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object,
 			_ = txn.Rollback()
 			return storage.NewInternalError(err)
 		}
+		// Admit against the collection quota using the STORED size (post
+		// rev-header and transformer), which is the size a future relist will
+		// have to scan and decode -- the quantity the quota actually protects.
+		if qerr := s.admitWrite(key, int64(len(transformed)), 0); qerr != nil {
+			_ = txn.Rollback()
+			metrics.RecordRequest("create", s.groupResource, qerr, startTime)
+			return qerr
+		}
+		createdBytes = int64(len(transformed))
 
 		if err := txn.Set(preparedKey, transformed); err != nil {
 			_ = txn.Rollback()
@@ -368,6 +383,7 @@ func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object,
 		break
 	}
 
+	s.noteWrite(createdBytes)
 	metrics.RecordRequest("create", s.groupResource, nil, startTime)
 
 	if out != nil {
@@ -481,6 +497,10 @@ func (s *store) Delete(
 			metrics.RecordRequest("delete", s.groupResource, err, startTime)
 			return err
 		}
+		// existing is the raw stored value read inside this txn, so this is an
+		// exact decrement -- deletes must be accounted precisely or a
+		// collection could never recover from hitting its quota.
+		s.noteWrite(-int64(len(existing)))
 		metrics.RecordRequest("delete", s.groupResource, nil, startTime)
 
 		if _, _, err := s.codec.Decode(currentState.data, nil, out); err != nil {
@@ -775,8 +795,11 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 	metrics.RecordList(s.groupResource, int(count), scannedBytes, pages)
 	// A completed unpaginated scan visited the whole resource, so scannedBytes
 	// is the approximate on-storage total -- publish it so keyspace growth that
-	// precedes a list OOM is observable/alertable (F1 visibility).
+	// precedes a list OOM is observable/alertable (F1 visibility), and use it
+	// as the authoritative correction for the collection-quota estimate, which
+	// otherwise drifts by whatever other apiserver replicas wrote.
 	if limit == 0 {
+		s.size.resync(scannedBytes)
 		metrics.UpdateResourceTotalBytes(s.groupResource, scannedBytes)
 	}
 	klog.V(4).InfoS("tikv GetList complete",
@@ -1058,6 +1081,19 @@ func (s *store) GuaranteedUpdate(
 		if err != nil {
 			return storage.NewInternalError(err)
 		}
+		// Collection quota. incoming is the exact stored size; the size being
+		// replaced is reconstructed as decoded + rev header, which understates
+		// the true stored size by the transformer's constant per-object
+		// overhead (~28 B for AES-GCM nonce+tag). That bias is conservative in
+		// the safe direction -- it slightly overstates growth, never
+		// understates it -- and the absolute value is corrected exactly on the
+		// next full relist.
+		newBytes := int64(len(transformedData))
+		oldBytes := int64(len(origState.data)) + revHeaderLen
+		if qerr := s.admitWrite(key, newBytes, oldBytes); qerr != nil {
+			metrics.RecordRequest("update", s.groupResource, qerr, startTime)
+			return qerr
+		}
 
 		txn, err := s.client.Begin()
 		if err != nil {
@@ -1088,6 +1124,9 @@ func (s *store) GuaranteedUpdate(
 
 		commitErr := txn.Commit(ctx)
 		metrics.RecordRequest("update", s.groupResource, commitErr, startTime)
+		if commitErr == nil {
+			s.noteWrite(newBytes - oldBytes)
+		}
 		if commitErr != nil {
 			if tikverr.IsErrWriteConflict(commitErr) {
 				metrics.RecordTxnConflict(s.groupResource)

@@ -123,7 +123,16 @@ var (
 	tikvResourceTotalBytes = compbasemetrics.NewGaugeVec(
 		&compbasemetrics.GaugeOpts{
 			Name:           "tikv_resource_total_bytes",
-			Help:           "Approximate total value bytes stored for a resource, observed during the last full (unpaginated) LIST. Tracks keyspace growth that precedes an apiserver list OOM.",
+			Help:           "Approximate total value bytes stored for a resource. Corrected exactly on each full (unpaginated) LIST and adjusted incrementally on writes. Tracks keyspace growth that precedes an apiserver list OOM.",
+			StabilityLevel: compbasemetrics.ALPHA,
+		},
+		[]string{"group", "resource"},
+	)
+
+	tikvCollectionQuotaRejectionsTotal = compbasemetrics.NewCounterVec(
+		&compbasemetrics.CounterOpts{
+			Name:           "tikv_collection_quota_rejections_total",
+			Help:           "Total writes rejected because the resource collection would exceed the per-collection storage quota (KUBE_APISERVER_TIKV_MAX_COLLECTION_BYTES). The TiKV analogue of etcd's NOSPACE alarm.",
 			StabilityLevel: compbasemetrics.ALPHA,
 		},
 		[]string{"group", "resource"},
@@ -190,6 +199,7 @@ func Register() {
 		legacyregistry.MustRegister(tikvListPagesTotal)
 		legacyregistry.MustRegister(tikvGuaranteedUpdateRetriesTotal)
 		legacyregistry.MustRegister(tikvResourceTotalBytes)
+		legacyregistry.MustRegister(tikvCollectionQuotaRejectionsTotal)
 		legacyregistry.MustRegister(tikvWatchPollDuration)
 		legacyregistry.MustRegister(tikvWatchTrackedKeys)
 		legacyregistry.MustRegister(tikvWatchReconstructReadsTotal)
@@ -244,6 +254,14 @@ func RecordGuaranteedUpdateRetry(groupResource schema.GroupResource) {
 // resource, as observed during a full (unpaginated) LIST scan.
 func UpdateResourceTotalBytes(groupResource schema.GroupResource, bytes int64) {
 	tikvResourceTotalBytes.WithLabelValues(groupResource.Group, groupResource.Resource).Set(float64(bytes))
+}
+
+// RecordCollectionQuotaRejection increments the counter of writes refused
+// because the collection is at its storage quota.  Alert on any non-zero rate:
+// it means a collection has stopped accepting growth and needs objects deleted
+// (or the quota deliberately raised).
+func RecordCollectionQuotaRejection(groupResource schema.GroupResource) {
+	tikvCollectionQuotaRejectionsTotal.WithLabelValues(groupResource.Group, groupResource.Resource).Inc()
 }
 
 // RecordWatchPoll records the duration of a single MVCC watch poll and the
